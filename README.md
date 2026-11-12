@@ -181,3 +181,22 @@ There are also some undocumented features like this:
         BOOT2 = NOBOOT
 
 Happy gaming.
+
+### Game list with partition names
+
+`hdl_dump.exe hdl_toc2 hdd1:` lists HDL games with their actual APA partition names after each title. Add `--csv` for semicolon-separated rows. This command only reads the disk. Existing `hdl_toc` output is unchanged.
+
+`hdl_dump.exe hdl_toc2 hdd1: --all` returns a versioned JSON inventory: all APA segments (type, flags, sector, main-segment and aggregate sizes in KiB, creation time), HDL game metadata on main partitions, and disk space in MiB. It opens the device once and reads the APA table once. This mode is separate from `--csv`. PFS file contents still require a filesystem reader.
+
+## Image regression tests
+
+Run with Python 3 and built executables; tests create disposable images:
+
+```sh
+python tests/test_native_inventory.py /path/to/hdl_dump
+python tests/test_rename_collision.py /path/to/hdl_dump
+python tests/test_short_rename.py /path/to/hdl_dump /path/to/pfsshell
+```
+
+These cover inventory output, self-name versus real partition collisions, and
+shortening a title followed by deletion through pfsshell.

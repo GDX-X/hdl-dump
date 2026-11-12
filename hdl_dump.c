@@ -68,6 +68,7 @@
 
 #define CSVPRINT            (1 << 1)
 #define CDVD_INFO_NEW_STYLE (1 << 2)
+#define HDL_TOC_PARTITIONS (1 << 3)
 
 /* command names */
 #define CMD_QUERY "query"
@@ -79,6 +80,7 @@
 #endif
 #define CMD_TOC     "toc"
 #define CMD_HDL_TOC "hdl_toc"
+#define CMD_HDL_TOC2 "hdl_toc2"
 #if defined(INCLUDE_MAP_CMD)
 #define CMD_MAP "map"
 #endif
@@ -410,7 +412,7 @@ show_hdl_toc(const dict_t *config,
             u_int32_t i, j;
             printf("%-4s%9s %-*s %-3s %-12s %s\n",
                    "type", "size", MAX_FLAGS * 2 - 1, "flags", "dma",
-                   "startup", "name");
+                   "startup", (flags & HDL_TOC_PARTITIONS) ? "name\tpartition" : "name");
             for (i = 0; i < glist->count; ++i) {
                 const hdl_game_info_t *game = glist->games + i;
                 char compat_flags[MAX_FLAGS * 2 + 1];
@@ -453,13 +455,16 @@ show_hdl_toc(const dict_t *config,
                     }
                 }
 
-                printf((flags & CSVPRINT) ? "%3s;%7luKB;%*s;%-3s;%-12s;%s\n" : "%3s %7luKB %*s %-3s %-12s %s\n",
+                printf((flags & CSVPRINT) ? "%3s;%7luKB;%*s;%-3s;%-12s;%s" : "%3s %7luKB %*s %-3s %-12s %s",
                        game->is_dvd != 0 ? "DVD" : "CD ",
                        (unsigned long)game->raw_size_in_kb,
                        MAX_FLAGS * 2 - 1, compat_flags,
                        dma,
                        game->startup,
                        game->name);
+                if (flags & HDL_TOC_PARTITIONS)
+                    printf((flags & CSVPRINT) ? ";%s" : "\t%s", game->partition_name);
+                putchar('\n');
             }
             printf("total %uMB, used %uMB, available %uMB\n",
                    (unsigned int)(glist->total_chunks * 8),
@@ -473,6 +478,95 @@ show_hdl_toc(const dict_t *config,
         (void)hio->close(hio), hio = NULL;
     }
     return (result);
+}
+
+/* JSON inventory for clients: one device open and one APA table read. */
+static void
+print_json_string(const char *value, size_t limit)
+{
+    size_t i;
+    putchar('"');
+    for (i = 0; i < limit && value[i] != '\0'; ++i) {
+        unsigned char c = (unsigned char)value[i];
+        if (c == '"' || c == '\\')
+            printf("\\%c", c);
+        else if (c < 0x20)
+            printf("\\u%04x", (unsigned int)c);
+        else
+            putchar(c);
+    }
+    putchar('"');
+}
+
+static int
+show_hdl_inventory(const dict_t *config, const char *device_name)
+{
+    hio_t *hio = NULL;
+    apa_toc_t *toc = NULL;
+    int result = hio_probe(config, device_name, &hio);
+    int slice, first = 1;
+    if (result != RET_OK || hio == NULL)
+        return result;
+    result = apa_toc_read_ex(hio, &toc);
+    if (result == RET_OK && toc != NULL) {
+        printf("{\"version\":1,\"partitions\":[");
+        for (slice = 0; slice < 2 && result == RET_OK; ++slice) {
+            u_int32_t i;
+            for (i = 0; i < toc->slice[slice].part_count; ++i) {
+                const ps2_partition_header_t *part = &toc->slice[slice].parts[i].header;
+                unsigned int type = get_u16(&part->type);
+                unsigned int flags = get_u16(&part->flags);
+                u_int32_t j, nsub = get_u32(&part->nsub);
+                u_int64_t size = get_u32(&part->length);
+                hdl_game_info_t game;
+                if (nsub > PS2_PART_MAXSUB) {
+                    result = RET_ERR;
+                    break;
+                }
+                if (flags == 0 && type == PS2_HDL_PARTITION) {
+                    memset(&game, 0, sizeof(game));
+                    result = hdl_ginfo_read(hio, slice, part, &game);
+                    if (result != RET_OK)
+                        break;
+                }
+                if (flags == 0)
+                    for (j = 0; j < nsub; ++j)
+                        size += get_u32(&part->subs[j].length);
+                printf("%s{\"name\":", first ? "" : ",");
+                first = 0;
+                print_json_string(part->id, PS2_PART_IDMAX);
+                printf(",\"type\":%u,\"flags\":%u,\"sector\":%llu,\"slice_kb\":%lu,\"size_kb\":%llu,",
+                       type, flags,
+                       (unsigned long long)get_u32(&part->start) + (unsigned long long)slice * 0x10000000,
+                       (unsigned long)(get_u32(&part->length) / 2),
+                       (unsigned long long)(size / 2));
+                printf("\"created\":\"%04u-%02u-%02u %02u:%02u\"",
+                       (unsigned int)get_u16(&part->created.year),
+                       (unsigned int)part->created.month, (unsigned int)part->created.day,
+                       (unsigned int)part->created.hour, (unsigned int)part->created.min);
+                if (flags == 0 && type == PS2_HDL_PARTITION) {
+                    printf(",\"game\":{\"title\":");
+                    print_json_string(game.name, HDL_GAME_NAME_MAX);
+                    printf(",\"startup\":");
+                    print_json_string(game.startup, sizeof(game.startup));
+                    printf(",\"raw_kb\":%lu,\"media\":\"%s\",\"compat_flags\":%u,\"dma\":%u}",
+                           (unsigned long)game.raw_size_in_kb, game.is_dvd ? "DVD" : "CD",
+                           (unsigned int)game.compat_flags, (unsigned int)game.dma);
+                }
+                putchar('}');
+            }
+        }
+        if (result == RET_OK) {
+            unsigned long total = (toc->slice[0].total_chunks + toc->slice[1].total_chunks) * 8;
+            unsigned long available = (toc->slice[0].free_chunks + toc->slice[1].free_chunks) * 8;
+            printf("],\"space\":{\"total_mb\":%lu,\"used_mb\":%lu,\"avail_mb\":%lu}}\n",
+                   total, total - available, available);
+        }
+    }
+    if (toc != NULL)
+        apa_toc_free(toc);
+    (void)hio->close(hio);
+    return result;
 }
 
 /**************************************************************/
@@ -1527,6 +1621,12 @@ show_usage_and_exit(const char *app_path,
          "Flags:\n"
          "--csv: Print data separated by semicolons, useful for scripts processing the output",
          "hdd1:", "192.168.0.10", 0},
+        {CMD_HDL_TOC2, "device [--csv | --all]",
+         "display all HDL games with their partition names",
+         "Flags:\n"
+         "--all: JSON inventory of all APA partitions, HDL games and disk space\n"
+         "--csv: Print data separated by semicolons, useful for scripts processing the output",
+         "hdd1:", "192.168.0.10", 0},
 #if defined(INCLUDE_MAP_CMD)
         {CMD_MAP, "device",
          "display PlayStation 2 HDD usage map", NULL,
@@ -2015,9 +2115,17 @@ int main(int argc, char *argv[])
             handle_result_and_exit(show_toc(config, argv[2], option), argv[2], NULL);
         }
 
-        else if (caseless_compare(command_name, CMD_HDL_TOC)) { /* show a TOC of installed games only */
+        else if (caseless_compare(command_name, CMD_HDL_TOC) ||
+                 caseless_compare(command_name, CMD_HDL_TOC2)) { /* show a TOC of installed games only */
             if (argc < 3)
-                show_usage_and_exit(argv[0], CMD_HDL_TOC);
+                show_usage_and_exit(argv[0], command_name);
+            if (caseless_compare(command_name, CMD_HDL_TOC2))
+                flags |= HDL_TOC_PARTITIONS;
+            if ((flags & HDL_TOC_PARTITIONS) && argc > 3 && !strcmp(argv[3], "--all")) {
+                if (argc != 4)
+                    show_usage_and_exit(argv[0], CMD_HDL_TOC2);
+                handle_result_and_exit(show_hdl_inventory(config, argv[2]), argv[2], NULL);
+            }
             if (argc > 3) {
                 if (!strcmp(argv[3], "--csv"))
                     flags |= CSVPRINT;

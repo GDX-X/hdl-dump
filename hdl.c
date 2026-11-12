@@ -1310,7 +1310,7 @@ int hdl_modify_game(hio_t *hio,
             strncpy(part_prefix, VISIBLE_PART, 3);
 
         if ((strncmp(part_prefix, part->header.id, 3) || new_name != NULL) && !toc->is_toxic) {
-            char part_id[PS2_PART_IDMAX];
+            char part_id[PS2_PART_IDMAX + 1];
             int tmp_slice_index = 0;
             u_int32_t tmp_partition_index = 0;
             char game_id[11];
@@ -1327,15 +1327,29 @@ int hdl_modify_game(hio_t *hio,
 
             result = apa_find_partition(toc, part_id, &tmp_slice_index,
                                         &tmp_partition_index);
-            if (result == RET_NOT_FOUND) {
-                strcpy(part->header.id, part_id);
-                set_u32(&part->header.checksum,
-                        apa_partition_checksum(&part->header));
-                part->modified = 1;
+            if (result == RET_OK) {
+                /* The title suffix may be truncated out of the APA ID. A
+                 * match on this same partition is valid: update its HDL title
+                 * without treating it as a collision with another game. */
+                if (tmp_slice_index != slice_index ||
+                    &toc->slice[tmp_slice_index].parts[tmp_partition_index] != part)
+                    result = RET_PART_EXISTS;
+            }
+            if (result == RET_NOT_FOUND || result == RET_OK) {
+                char canonical_id[PS2_PART_IDMAX];
+                /* APA compares all 32 bytes, including the bytes after NUL.
+                 * Clear the old suffix when shortening a name. Also repair
+                 * stale padding when the requested name matches this partition. */
+                memset(canonical_id, 0, sizeof(canonical_id));
+                memcpy(canonical_id, part_id, strlen(part_id));
+                if (memcmp(part->header.id, canonical_id, sizeof(canonical_id)) != 0) {
+                    memcpy(part->header.id, canonical_id, sizeof(canonical_id));
+                    set_u32(&part->header.checksum,
+                            apa_partition_checksum(&part->header));
+                    part->modified = 1;
+                }
                 result = RET_OK;
-            } else if (result == RET_OK)
-                /* partition with such name already exists */
-                result = RET_PART_EXISTS;
+            }
         }
 
         /* BUG: Renaming a game with hdl_dump modify may cause it to show as corrupted data in HDDOSD */
